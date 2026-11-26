@@ -51,8 +51,9 @@ CREATE TABLE Impuestos_Historico (
     INDEX idx_impuestos_vigente (es_vigente, fecha_inicio_vigencia)
 ) ENGINE=InnoDB;
 
--- 4. TABLA: Servicios (Catálogo de al menos 100 servicios)
+-- 4. TABLA: Servicios (Catálogo denso de al menos 100 servicios con exactamente 50 columnas/características)
 CREATE TABLE Servicios (
+    -- 1-11: Columnas Base de Identidad y Catálogo
     id_servicio INT AUTO_INCREMENT PRIMARY KEY,
     codigo_interno VARCHAR(20) NOT NULL UNIQUE,
     clave_prod_serv_sat VARCHAR(10) NOT NULL DEFAULT '81112000',
@@ -64,8 +65,59 @@ CREATE TABLE Servicios (
     aplica_retencion BOOLEAN NOT NULL DEFAULT FALSE,
     activo BOOLEAN NOT NULL DEFAULT TRUE,
     actualizado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    -- 12-21: Infraestructura y Cómputo Cloud (10 columnas)
+    region_aws_default VARCHAR(25) NOT NULL DEFAULT 'us-east-1',
+    arquitectura_cpu ENUM('x86_64', 'arm64_graviton', 'serverless') NOT NULL DEFAULT 'x86_64',
+    memoria_ram_gb DECIMAL(6,2) NOT NULL DEFAULT 4.00,
+    vcpus INT NOT NULL DEFAULT 2,
+    almacenamiento_gb INT NOT NULL DEFAULT 50,
+    tipo_almacenamiento ENUM('EBS_GP3', 'EBS_IO2', 'S3_STANDARD', 'AURORA_STORAGE') NOT NULL DEFAULT 'EBS_GP3',
+    ancho_banda_gbps DECIMAL(5,2) NOT NULL DEFAULT 5.00,
+    ip_publica_dedicada BOOLEAN NOT NULL DEFAULT FALSE,
+    version_software VARCHAR(30) NOT NULL DEFAULT 'v1.0',
+    tiempo_aprovisionamiento_min INT NOT NULL DEFAULT 15,
+
+    -- 22-29: SLA, Disponibilidad y Resiliencia (8 columnas)
+    sla_disponibilidad_porc DECIMAL(5,2) NOT NULL DEFAULT 99.90,
+    tiempo_respuesta_soporte_hrs INT NOT NULL DEFAULT 4,
+    soporte_24_7 BOOLEAN NOT NULL DEFAULT TRUE,
+    nivel_soporte ENUM('BASICO', 'BUSINESS', 'ENTERPRISE') NOT NULL DEFAULT 'BUSINESS',
+    multiaz_habilitado BOOLEAN NOT NULL DEFAULT TRUE,
+    backup_automatico_horas INT NOT NULL DEFAULT 24,
+    rpo_minutos INT NOT NULL DEFAULT 60,
+    rto_minutos INT NOT NULL DEFAULT 120,
+
+    -- 30-37: Seguridad y Cumplimiento (8 columnas)
+    cifrado_en_reposo BOOLEAN NOT NULL DEFAULT TRUE,
+    algoritmo_cifrado VARCHAR(30) NOT NULL DEFAULT 'AES-256',
+    cifrado_en_transito BOOLEAN NOT NULL DEFAULT TRUE,
+    cumplimiento_pci_dss BOOLEAN NOT NULL DEFAULT FALSE,
+    cumplimiento_iso27001 BOOLEAN NOT NULL DEFAULT TRUE,
+    cumplimiento_soc2 BOOLEAN NOT NULL DEFAULT TRUE,
+    retencion_logs_dias INT NOT NULL DEFAULT 365,
+    waf_incluido BOOLEAN NOT NULL DEFAULT FALSE,
+
+    -- 38-46: Comercial, Fiscal y Facturación (9 columnas)
+    moneda VARCHAR(3) NOT NULL DEFAULT 'MXN',
+    tipo_facturacion ENUM('MENSUAL', 'POR_HORA', 'ANUAL', 'POR_EVENTO') NOT NULL DEFAULT 'MENSUAL',
+    ciclo_cobro VARCHAR(20) NOT NULL DEFAULT 'ANTICIPADO',
+    descuento_maximo_porc DECIMAL(5,2) NOT NULL DEFAULT 15.00,
+    plazo_minimo_meses INT NOT NULL DEFAULT 1,
+    penalizacion_cancelacion_porc DECIMAL(5,2) NOT NULL DEFAULT 0.00,
+    objeto_impuesto_sat VARCHAR(3) NOT NULL DEFAULT '02',
+    unidad_medida_sat VARCHAR(30) NOT NULL DEFAULT 'Servicio',
+    costo_operativo_estimado DECIMAL(12,2) NOT NULL DEFAULT 500.00,
+
+    -- 47-50: Operación, Métricas y Lifecycle (4 columnas)
+    margen_ganancia_porc DECIMAL(5,2) NOT NULL DEFAULT 30.00,
+    consumo_kwh_estimado DECIMAL(8,2) NOT NULL DEFAULT 15.50,
+    limite_peticiones_mes INT NOT NULL DEFAULT 1000000,
+    responsable_tecnico VARCHAR(100) NOT NULL DEFAULT 'equipo-infraestructura@cloudtech.mx',
+
     INDEX idx_servicios_categoria (categoria),
-    INDEX idx_servicios_activo (activo)
+    INDEX idx_servicios_activo (activo),
+    INDEX idx_servicios_sla (sla_disponibilidad_porc)
 ) ENGINE=InnoDB;
 
 -- 5. TABLA: Catalogo_Caracteristicas (Al menos 50 características configurables)

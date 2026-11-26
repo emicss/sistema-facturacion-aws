@@ -6,11 +6,20 @@ from decimal import Decimal
 from typing import List, Optional
 
 from boto3.dynamodb.conditions import Key
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Header, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from db import dynamo_table, get_db_connection, registrar_auditoria
+from db import (
+    dynamo_table,
+    idempotency_table,
+    get_db_connection,
+    registrar_auditoria,
+    verificar_idempotencia,
+    iniciar_idempotencia,
+    completar_idempotencia,
+)
+from events import EstadoEvento, TipoEvento, construir_detalle_evento
 from security import (
     create_access_token,
     get_current_user,
@@ -88,7 +97,7 @@ class CambioTarifaRequest(BaseModel):
 
 
 # ============================================================================
-# HEALTH CHECK (Verifica RDS + DynamoDB)
+# HEALTH CHECK (Verifica RDS + DynamoDB Eventos + DynamoDB Idempotencia)
 # ============================================================================
 @app.get("/health", tags=["Sistema"])
 def health_check():
@@ -98,19 +107,22 @@ def health_check():
             cur.execute("SELECT COUNT(*) AS total_servicios FROM Servicios")
             servicios = cur.fetchone()["total_servicios"]
         dynamo_status = dynamo_table.table_status
+        idempotencia_status = idempotency_table.table_status
         return {
             "status": "ok",
             "rds_mysql": "conectado",
             "servicios_en_catalogo": servicios,
             "dynamodb_tabla": dynamo_table.name,
             "dynamodb_estado": dynamo_status,
+            "idempotencia_tabla": idempotency_table.name,
+            "idempotencia_estado": idempotencia_status,
         }
     finally:
         conn.close()
 
 
 # ============================================================================
-# 1. AUTENTICACIÓN JWT, RBAC Y SESIONES EN DYNAMODB
+# 1. AUTENTICACIÓN JWT Y RBAC (RDS MySQL como Única Fuente de Verdad)
 # ============================================================================
 @app.post("/auth/login", tags=["Autenticación"])
 def login(payload: LoginRequest):
@@ -128,22 +140,20 @@ def login(payload: LoginRequest):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciales inválidas")
 
         token = create_access_token(user["id_usuario"], user["email"], user["rol"])
-        ahora = datetime.now(timezone.utc).isoformat()
-        session_id = str(uuid.uuid4())[:12]
 
-        # Guardar sesión activa en DynamoDB con TTL (2 horas)
-        dynamo_table.put_item(
-            Item={
-                "PK": f"USER#{user['id_usuario']}",
-                "SK": f"SESSION#{session_id}",
-                "GSI1PK": "TYPE#SESSION",
-                "GSI1SK": ahora,
-                "email": user["email"],
-                "rol": user["rol"],
-                "ttl_expira": int(time.time()) + 7200,
-            }
+        # Nota de arquitectura: RDS MySQL es la ÚNICA fuente de verdad para usuarios.
+        # En DynamoDB únicamente registramos el evento inmutable de auditoría para trazabilidad fiscal.
+        registrar_auditoria(
+            id_usuario=user["id_usuario"],
+            accion=TipoEvento.LOGIN.value,
+            detalle=construir_detalle_evento(
+                emisor="CloudTech Systems S.A. de C.V.",
+                receptor=user["email"],
+                estado=EstadoEvento.EXITOSO.value,
+                metadatos={"email": user["email"], "rol": user["rol"]},
+            ),
+            estado=EstadoEvento.EXITOSO.value,
         )
-        registrar_auditoria(user["id_usuario"], "LOGIN_EXITOSO", {"email": user["email"], "rol": user["rol"]})
 
         return {
             "access_token": token,
@@ -174,7 +184,16 @@ def register_user(
             )
             nuevo_id = cur.lastrowid
         conn.commit()
-        registrar_auditoria(current_user["id_usuario"], "CREAR_USUARIO", {"nuevo_id": nuevo_id, "rol": payload.rol})
+        registrar_auditoria(
+            id_usuario=current_user["id_usuario"],
+            accion=TipoEvento.CREAR_USUARIO.value,
+            detalle=construir_detalle_evento(
+                receptor=payload.email,
+                estado=EstadoEvento.EXITOSO.value,
+                metadatos={"nuevo_id": nuevo_id, "rol": payload.rol},
+            ),
+            estado=EstadoEvento.EXITOSO.value,
+        )
         return {"mensaje": "Usuario creado", "id_usuario": nuevo_id}
     except Exception as e:
         conn.rollback()
@@ -184,7 +203,7 @@ def register_user(
 
 
 # ============================================================================
-# 2. CATÁLOGO DE SERVICIOS, CARACTERÍSTICAS Y CLIENTES (RDS + SP 9 y SP 10)
+# 2. CATÁLOGO DE SERVICIOS (50 Características), CARACTERÍSTICAS Y CLIENTES
 # ============================================================================
 @app.get("/servicios", tags=["Catálogo"])
 def listar_servicios(
@@ -208,6 +227,21 @@ def listar_servicios(
                 )
             servicios = cur.fetchall()
         return {"total_devueltos": len(servicios), "servicios": servicios}
+    finally:
+        conn.close()
+
+
+@app.get("/servicios/{id_servicio}", tags=["Catálogo"])
+def obtener_detalle_servicio(id_servicio: int, current_user: dict = Depends(get_current_user)):
+    """Devuelve las 50 características completas de un servicio individual."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM Servicios WHERE id_servicio = %s", (id_servicio,))
+            srv = cur.fetchone()
+            if not srv:
+                raise HTTPException(status_code=404, detail="Servicio no encontrado")
+            return {"id_servicio": id_servicio, "servicio": srv}
     finally:
         conn.close()
 
@@ -273,13 +307,17 @@ def asignar_caracteristicas_masivas(
             res = cur.fetchone()
         conn.commit()
         registrar_auditoria(
-            current_user["id_usuario"],
-            "SP9_ASIGNACION_MASIVA",
-            {
-                "categoria": payload.categoria,
-                "id_caracteristica": payload.id_caracteristica,
-                "valor": payload.valor_configurado,
-            },
+            id_usuario=current_user["id_usuario"],
+            accion=TipoEvento.ASIGNACION_MASIVA.value,
+            detalle=construir_detalle_evento(
+                estado=EstadoEvento.EXITOSO.value,
+                metadatos={
+                    "categoria": payload.categoria,
+                    "id_caracteristica": payload.id_caracteristica,
+                    "valor": payload.valor_configurado,
+                },
+            ),
+            estado=EstadoEvento.EXITOSO.value,
         )
         return {"mensaje": "Asignación masiva ejecutada", "resultado": res}
     except Exception as e:
@@ -305,9 +343,14 @@ def actualizar_tarifa_servicio(
             )
         conn.commit()
         registrar_auditoria(
-            current_user["id_usuario"],
-            "SP10_CAMBIO_TARIFA",
-            {"id_servicio": id_servicio, "nuevo_precio": str(payload.nuevo_precio), "motivo": payload.motivo},
+            id_usuario=current_user["id_usuario"],
+            accion=TipoEvento.CAMBIO_TARIFA.value,
+            detalle=construir_detalle_evento(
+                monto=payload.nuevo_precio,
+                estado=EstadoEvento.EXITOSO.value,
+                metadatos={"id_servicio": id_servicio, "nuevo_precio": str(payload.nuevo_precio), "motivo": payload.motivo},
+            ),
+            estado=EstadoEvento.EXITOSO.value,
         )
         return {"mensaje": "Tarifa actualizada y auditada correctamente", "id_servicio": id_servicio}
     except Exception as e:
@@ -380,17 +423,49 @@ def quitar_del_carrito(
 @app.post("/facturas/emitir", tags=["Facturación (SP)"])
 def emitir_factura(
     payload: EmitirFacturaRequest,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     current_user: dict = Depends(require_roles(["ADMIN", "OPERADOR"])),
 ):
     """
-    Flujo transaccional completo:
-    1. Lee carrito en DynamoDB (o usa items enviados en JSON).
-    2. SP 1: Genera folio atómico y cabecera de factura.
-    3. Inserta Detalle_Factura con precios vigentes de RDS.
-    4. SP 3 + SP 2: Aplica descuento (cliente/volumen) y calcula Subtotal, IVA y Retenciones.
-    5. SP 8: Timbra factura (genera UUID y JSON CFDI).
-    6. Limpia carrito en DynamoDB y guarda log de auditoría.
+    Flujo transaccional completo e idempotente:
+    1. Verifica si la Idempotency-Key ya fue procesada (evita folios y cobros duplicados).
+    2. Lee carrito en DynamoDB (o usa items enviados en JSON).
+    3. SP 1: Genera folio atómico y cabecera de factura.
+    4. Inserta Detalle_Factura con precios vigentes de RDS.
+    5. SP 3 + SP 2: Aplica descuento (cliente/volumen) y calcula Subtotal, IVA y Retenciones.
+    6. SP 8: Timbra factura (genera UUID y JSON CFDI).
+    7. Limpia carrito en DynamoDB, audita evento y completa estado de idempotencia a COMPLETADO.
     """
+    if not idempotency_key:
+        raw_key = f"{current_user['id_usuario']}-{payload.id_cliente}-{payload.serie}-{payload.usar_carrito_dynamo}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M')}"
+        idempotency_key = f"IDEM-EMIT-{uuid.uuid5(uuid.NAMESPACE_DNS, raw_key)}"
+
+    # 1. Verificar si ya existe en facturacion_idempotencia
+    item_existente = verificar_idempotencia(idempotency_key)
+    if item_existente:
+        estado_prev = item_existente.get("estado")
+        if estado_prev == "COMPLETADO":
+            cached = item_existente.get("response_data", {})
+            return {
+                **cached,
+                "idempotente": True,
+                "idempotency_key": idempotency_key,
+                "mensaje_idempotencia": "Respuesta recuperada de facturacion_idempotencia (operación ya procesada previamente)",
+            }
+        elif estado_prev == "EN_PROCESO":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Operación en proceso con Idempotency-Key '{idempotency_key}'. Reintente en unos segundos.",
+            )
+
+    # 2. Registrar en estado EN_PROCESO
+    iniciar_idempotencia(
+        idempotency_key=idempotency_key,
+        operacion="EMITIR_Y_TIMBRAR_FACTURA",
+        id_usuario=current_user["id_usuario"],
+        request_payload=payload.model_dump(),
+    )
+
     items_a_facturar = []
     pk_cart = f"CART#{current_user['id_usuario']}"
 
@@ -405,6 +480,7 @@ def emitir_factura(
         items_a_facturar = [it.model_dump() for it in payload.items]
 
     if not items_a_facturar:
+        completar_idempotencia(idempotency_key, "FALLIDO", {"error": "No hay servicios a facturar"})
         raise HTTPException(status_code=400, detail="No hay servicios en el carrito ni en la petición.")
 
     conn = get_db_connection()
@@ -455,22 +531,41 @@ def emitir_factura(
                 dynamo_table.delete_item(Key={"PK": pk_cart, "SK": f"ITEM#{item['id_servicio']}"})
 
         comprobante = json.loads(timbrado_row["comprobante_json"]) if timbrado_row else {}
-        registrar_auditoria(
-            current_user["id_usuario"],
-            "EMITIR_Y_TIMBRAR_FACTURA",
-            {"id_factura": id_factura, "serie": payload.serie, "folio": folio},
-        )
-        return {
+        total_factura = float(comprobante.get("total", 0.0)) if isinstance(comprobante, dict) and "total" in comprobante else 0.0
+
+        resp_data = {
             "mensaje": "Factura emitida y timbrada exitosamente",
             "id_factura": id_factura,
             "folio": f"{payload.serie}-{folio}",
             "comprobante_cfdi": comprobante,
+            "idempotency_key": idempotency_key,
         }
+
+        # 3. Guardar estado COMPLETADO en facturacion_idempotencia
+        completar_idempotencia(idempotency_key, "COMPLETADO", resp_data)
+
+        # 4. Registrar evento estructurado en FacturacionEventos
+        registrar_auditoria(
+            id_usuario=current_user["id_usuario"],
+            accion=TipoEvento.EMISION_FACTURA.value,
+            detalle=construir_detalle_evento(
+                folio=f"{payload.serie}-{folio}",
+                emisor="CloudTech Systems S.A. de C.V.",
+                receptor=str(payload.id_cliente),
+                monto=total_factura,
+                estado=EstadoEvento.EXITOSO.value,
+                metadatos={"id_factura": id_factura, "serie": payload.serie, "folio": folio},
+            ),
+            estado=EstadoEvento.EXITOSO.value,
+        )
+        return resp_data
     except HTTPException:
         conn.rollback()
+        completar_idempotencia(idempotency_key, "FALLIDO", {"error": "HTTPException"})
         raise
     except Exception as e:
         conn.rollback()
+        completar_idempotencia(idempotency_key, "FALLIDO", {"error": str(e)})
         raise HTTPException(status_code=400, detail=str(e))
     finally:
         conn.close()
@@ -526,9 +621,16 @@ def cancelar_factura(
             cur.callproc("sp_cancelar_factura", (id_factura, payload.motivo))
         conn.commit()
         registrar_auditoria(
-            current_user["id_usuario"],
-            "SP4_CANCELAR_FACTURA",
-            {"id_factura": id_factura, "motivo": payload.motivo},
+            id_usuario=current_user["id_usuario"],
+            accion=TipoEvento.CANCELACION_FACTURA.value,
+            detalle=construir_detalle_evento(
+                folio=f"FAC-ID#{id_factura}",
+                emisor="CloudTech Systems S.A. de C.V.",
+                receptor="Cancelación Fiscal SAT",
+                estado=EstadoEvento.CANCELADO.value,
+                metadatos={"id_factura": id_factura, "motivo": payload.motivo},
+            ),
+            estado=EstadoEvento.CANCELADO.value,
         )
         return {"mensaje": "Factura cancelada y pagos revertidos contablemente", "id_factura": id_factura}
     except Exception as e:
@@ -539,15 +641,46 @@ def cancelar_factura(
 
 
 # ============================================================================
-# 5. PAGOS Y VALIDACIÓN DE SALDOS (SP 6)
+# 5. PAGOS Y VALIDACIÓN DE SALDOS (SP 6) CON CONTROL DE IDEMPOTENCIA
 # ============================================================================
 @app.post("/facturas/{id_factura}/pagos", tags=["Pagos (SP)"])
 def registrar_pago(
     id_factura: int,
     payload: RegistrarPagoRequest,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     current_user: dict = Depends(require_roles(["ADMIN", "CONTADOR"])),
 ):
-    """Inserta abono en Pagos y ejecuta SP 6 para recalcular saldo y estado_pago."""
+    """Inserta abono en Pagos de forma idempotente y ejecuta SP 6 para recalcular saldo y estado_pago."""
+    if not idempotency_key:
+        raw_key = f"PAGO-{id_factura}-{payload.monto_pagado}-{payload.referencia_bancaria}"
+        idempotency_key = f"IDEM-PAY-{uuid.uuid5(uuid.NAMESPACE_DNS, raw_key)}"
+
+    # 1. Verificar si la llave ya fue procesada
+    item_existente = verificar_idempotencia(idempotency_key)
+    if item_existente:
+        estado_prev = item_existente.get("estado")
+        if estado_prev == "COMPLETADO":
+            cached = item_existente.get("response_data", {})
+            return {
+                **cached,
+                "idempotente": True,
+                "idempotency_key": idempotency_key,
+                "mensaje_idempotencia": "Respuesta recuperada de facturacion_idempotencia (pago ya aplicado previamente)",
+            }
+        elif estado_prev == "EN_PROCESO":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Pago en proceso con Idempotency-Key '{idempotency_key}'. Reintente en breve.",
+            )
+
+    # 2. Registrar en estado EN_PROCESO
+    iniciar_idempotencia(
+        idempotency_key=idempotency_key,
+        operacion="REGISTRAR_PAGO",
+        id_usuario=current_user["id_usuario"],
+        request_payload={"id_factura": id_factura, **payload.model_dump()},
+    )
+
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -567,19 +700,52 @@ def registrar_pago(
             conn.commit()
 
             cur.execute(
-                "SELECT id_factura, total, saldo_pendiente, estado_pago FROM Facturas WHERE id_factura = %s",
+                "SELECT id_factura, serie, folio, total, saldo_pendiente, estado_pago FROM Facturas WHERE id_factura = %s",
                 (id_factura,),
             )
             estado = cur.fetchone()
 
-        registrar_auditoria(
-            current_user["id_usuario"],
-            "SP6_REGISTRAR_PAGO",
-            {"id_factura": id_factura, "monto": str(payload.monto_pagado), "referencia": payload.referencia_bancaria},
+        resp_data = {
+            "mensaje": "Pago registrado y estado validado",
+            "factura": estado,
+            "idempotency_key": idempotency_key,
+        }
+
+        # 3. Marcar COMPLETADO en facturacion_idempotencia
+        completar_idempotencia(idempotency_key, "COMPLETADO", resp_data)
+
+        # 4. Registrar evento
+        tipo_pago = (
+            TipoEvento.PAGO_TOTAL.value
+            if float(estado["saldo_pendiente"]) == 0
+            else TipoEvento.PAGO_PARCIAL.value
         )
-        return {"mensaje": "Pago registrado y estado validado", "factura": estado}
+        registrar_auditoria(
+            id_usuario=current_user["id_usuario"],
+            accion=tipo_pago,
+            detalle=construir_detalle_evento(
+                folio=f"{estado['serie']}-{estado['folio']}",
+                emisor="CloudTech Systems S.A. de C.V.",
+                receptor=f"Factura #{id_factura}",
+                monto=float(payload.monto_pagado),
+                estado=EstadoEvento.EXITOSO.value,
+                metadatos={
+                    "id_factura": id_factura,
+                    "saldo_restante": str(estado["saldo_pendiente"]),
+                    "referencia": payload.referencia_bancaria,
+                    "metodo": payload.metodo_pago,
+                },
+            ),
+            estado=EstadoEvento.EXITOSO.value,
+        )
+        return resp_data
+    except HTTPException:
+        conn.rollback()
+        completar_idempotencia(idempotency_key, "FALLIDO", {"error": "HTTPException"})
+        raise
     except Exception as e:
         conn.rollback()
+        completar_idempotencia(idempotency_key, "FALLIDO", {"error": str(e)})
         raise HTTPException(status_code=400, detail=str(e))
     finally:
         conn.close()
@@ -599,7 +765,17 @@ def reporte_cierre_fiscal(
     try:
         with conn.cursor() as cur:
             cur.callproc("sp_cierre_fiscal_consolidado", (str(fecha_inicio), str(fecha_fin)))
-            return {"cierre_fiscal": cur.fetchall()}
+            rows = cur.fetchall()
+        registrar_auditoria(
+            id_usuario=current_user["id_usuario"],
+            accion=TipoEvento.CONSULTA_REPORTE.value,
+            detalle=construir_detalle_evento(
+                estado=EstadoEvento.EXITOSO.value,
+                metadatos={"reporte": "sp_cierre_fiscal_consolidado", "fecha_inicio": str(fecha_inicio), "fecha_fin": str(fecha_fin)},
+            ),
+            estado=EstadoEvento.EXITOSO.value,
+        )
+        return {"cierre_fiscal": rows}
     finally:
         conn.close()
 
@@ -613,7 +789,17 @@ def reporte_antiguedad_saldos(
     try:
         with conn.cursor() as cur:
             cur.callproc("sp_reporte_antiguedad_saldos")
-            return {"antiguedad_saldos": cur.fetchall()}
+            rows = cur.fetchall()
+        registrar_auditoria(
+            id_usuario=current_user["id_usuario"],
+            accion=TipoEvento.CONSULTA_REPORTE.value,
+            detalle=construir_detalle_evento(
+                estado=EstadoEvento.EXITOSO.value,
+                metadatos={"reporte": "sp_reporte_antiguedad_saldos"},
+            ),
+            estado=EstadoEvento.EXITOSO.value,
+        )
+        return {"antiguedad_saldos": rows}
     finally:
         conn.close()
 
@@ -633,7 +819,14 @@ def listar_logs_auditoria(
 
 from fastapi.responses import FileResponse
 import os
+from mangum import Mangum
 
 @app.get("/", include_in_schema=False)
 def serve_frontend():
-    return FileResponse(os.path.join(os.path.dirname(__file__), "../frontend/index.html"))
+    path = os.path.join(os.path.dirname(__file__), "frontend/index.html")
+    if not os.path.exists(path):
+        path = os.path.join(os.path.dirname(__file__), "../frontend/index.html")
+    return FileResponse(path)
+
+# Handler Serverless para AWS Lambda
+handler = Mangum(app, lifespan="off")

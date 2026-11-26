@@ -35,10 +35,20 @@ INSERT INTO Series_Folios (serie, descripcion, folio_actual) VALUES
 ('HON', 'Recibos de Honorarios y Consultoría', 500),
 ('NC', 'Notas de Crédito y Reversiones', 100);
 
--- 5. CATÁLOGO DE 100 SERVICIOS (Generación sintética estructurada en 10 categorías)
+-- 5. CATÁLOGO DE 100 SERVICIOS (Generación sintética con 50 columnas estructuradas en 10 categorías)
 INSERT INTO Servicios (
     codigo_interno, clave_prod_serv_sat, clave_unidad_sat,
-    nombre_servicio, descripcion, categoria, precio_unitario, aplica_retencion, activo
+    nombre_servicio, descripcion, categoria,
+    region_aws_default, arquitectura_cpu, memoria_ram_gb, vcpus, almacenamiento_gb,
+    tipo_almacenamiento, ancho_banda_gbps, ip_publica_dedicada, version_software, tiempo_aprovisionamiento_min,
+    sla_disponibilidad_porc, tiempo_respuesta_soporte_hrs, soporte_24_7, nivel_soporte,
+    multiaz_habilitado, backup_automatico_horas, rpo_minutos, rto_minutos,
+    cifrado_en_reposo, algoritmo_cifrado, cifrado_en_transito, cumplimiento_pci_dss,
+    cumplimiento_iso27001, cumplimiento_soc2, retencion_logs_dias, waf_incluido,
+    precio_unitario, moneda, tipo_facturacion, ciclo_cobro, descuento_maximo_porc,
+    plazo_minimo_meses, penalizacion_cancelacion_porc, objeto_impuesto_sat, unidad_medida_sat,
+    costo_operativo_estimado, aplica_retencion, margen_ganancia_porc, consumo_kwh_estimado,
+    limite_peticiones_mes, responsable_tecnico, activo
 )
 WITH RECURSIVE seq(n) AS (
     SELECT 1
@@ -70,8 +80,94 @@ SELECT
         'Cloud Computing', 'Ciberseguridad', 'Bases de Datos', 'Desarrollo',
         'DevOps', 'Analítica', 'Soporte', 'Auditoría', 'Redes', 'IA y Datos'
     ) AS categoria,
+
+    -- Infraestructura y Cómputo Cloud
+    ELT((n % 4) + 1, 'us-east-1', 'us-west-2', 'sa-east-1', 'eu-west-1') AS region_aws_default,
+    CASE
+        WHEN (n % 10) + 1 IN (1, 3) THEN 'arm64_graviton'
+        WHEN (n % 10) + 1 IN (5, 10) THEN 'x86_64'
+        ELSE 'serverless'
+    END AS arquitectura_cpu,
+    CASE
+        WHEN (n % 10) + 1 = 3 THEN 32.00
+        WHEN (n % 10) + 1 = 10 THEN 64.00
+        WHEN (n % 10) + 1 = 1 THEN 16.00
+        WHEN (n % 10) + 1 = 4 THEN 8.00
+        ELSE 4.00
+    END AS memoria_ram_gb,
+    CASE
+        WHEN (n % 10) + 1 IN (3, 10) THEN 8
+        WHEN (n % 10) + 1 = 1 THEN 4
+        ELSE 2
+    END AS vcpus,
+    CASE
+        WHEN (n % 10) + 1 = 3 THEN 500
+        WHEN (n % 10) + 1 = 10 THEN 1000
+        WHEN (n % 10) + 1 = 1 THEN 200
+        ELSE 50
+    END AS almacenamiento_gb,
+    CASE
+        WHEN (n % 10) + 1 = 3 THEN 'AURORA_STORAGE'
+        WHEN (n % 10) + 1 = 10 THEN 'EBS_IO2'
+        WHEN (n % 10) + 1 = 1 THEN 'EBS_GP3'
+        ELSE 'S3_STANDARD'
+    END AS tipo_almacenamiento,
+    IF((n % 10) + 1 IN (1, 9), 25.00, IF((n % 10) + 1 = 2, 10.00, 5.00)) AS ancho_banda_gbps,
+    IF((n % 10) + 1 IN (1, 2, 9), TRUE, FALSE) AS ip_publica_dedicada,
+    CONCAT('v2.', (n % 5), '.', (n % 9)) AS version_software,
+    CASE
+        WHEN (n % 10) + 1 = 1 THEN 5
+        WHEN (n % 10) + 1 = 3 THEN 10
+        WHEN (n % 10) + 1 = 8 THEN 120
+        ELSE 15
+    END AS tiempo_aprovisionamiento_min,
+
+    -- SLA, Disponibilidad y Resiliencia
+    CASE
+        WHEN (n % 10) + 1 IN (2, 3) THEN 99.99
+        WHEN (n % 10) + 1 = 1 THEN 99.95
+        ELSE 99.90
+    END AS sla_disponibilidad_porc,
+    IF((n % 10) + 1 IN (2, 3), 1, 4) AS tiempo_respuesta_soporte_hrs,
+    IF((n % 10) + 1 IN (1, 2, 3), TRUE, FALSE) AS soporte_24_7,
+    CASE
+        WHEN (n % 10) + 1 IN (2, 3) THEN 'ENTERPRISE'
+        WHEN (n % 10) + 1 IN (1, 5) THEN 'BUSINESS'
+        ELSE 'BASICO'
+    END AS nivel_soporte,
+    IF((n % 10) + 1 IN (1, 2, 3), TRUE, FALSE) AS multiaz_habilitado,
+    IF((n % 10) + 1 = 3, 6, 24) AS backup_automatico_horas,
+    IF((n % 10) + 1 = 3, 5, 60) AS rpo_minutos,
+    IF((n % 10) + 1 = 3, 15, 120) AS rto_minutos,
+
+    -- Seguridad y Cumplimiento
+    TRUE AS cifrado_en_reposo,
+    'AES-256-GCM' AS algoritmo_cifrado,
+    TRUE AS cifrado_en_transito,
+    IF((n % 10) + 1 IN (2, 3, 8), TRUE, FALSE) AS cumplimiento_pci_dss,
+    TRUE AS cumplimiento_iso27001,
+    TRUE AS cumplimiento_soc2,
+    IF((n % 10) + 1 IN (2, 8), 730, 365) AS retencion_logs_dias,
+    IF((n % 10) + 1 IN (2, 4, 9), TRUE, FALSE) AS waf_incluido,
+
+    -- Comercial, Fiscal y Facturación
     ROUND(1500.00 + ((n * 375.50) % 18500), 2) AS precio_unitario,
+    'MXN' AS moneda,
+    ELT((n % 4) + 1, 'MENSUAL', 'POR_HORA', 'ANUAL', 'POR_EVENTO') AS tipo_facturacion,
+    'ANTICIPADO' AS ciclo_cobro,
+    IF((n % 10) + 1 = 8, 5.00, 20.00) AS descuento_maximo_porc,
+    IF((n % 10) + 1 = 3, 12, 1) AS plazo_minimo_meses,
+    IF((n % 10) + 1 = 3, 10.00, 0.00) AS penalizacion_cancelacion_porc,
+    '02' AS objeto_impuesto_sat,
+    'Servicio' AS unidad_medida_sat,
+    ROUND((1500.00 + ((n * 375.50) % 18500)) * 0.45, 2) AS costo_operativo_estimado,
+
+    -- Operación y Lifecycle
     IF(n % 3 = 0, TRUE, FALSE) AS aplica_retencion,
+    55.00 AS margen_ganancia_porc,
+    ROUND(10.0 + (CASE WHEN (n % 10) + 1 IN (3, 10) THEN 8 WHEN (n % 10) + 1 = 1 THEN 4 ELSE 2 END * 4.5), 2) AS consumo_kwh_estimado,
+    IF((n % 10) + 1 = 10, 5000000, 1000000) AS limite_peticiones_mes,
+    CONCAT(LOWER(REPLACE(ELT((n % 10) + 1, 'Cloud Computing', 'Ciberseguridad', 'Bases de Datos', 'Desarrollo', 'DevOps', 'Analítica', 'Soporte', 'Auditoría', 'Redes', 'IA y Datos'), ' ', '')), '-soporte@cloudtech.mx') AS responsable_tecnico,
     TRUE AS activo
 FROM seq;
 
