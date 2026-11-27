@@ -93,7 +93,7 @@ def verificar_idempotencia(idempotency_key: str) -> Optional[Dict[str, Any]]:
     if not idempotency_key:
         return None
     try:
-        resp = idempotency_table.get_item(Key={"idempotency_key": idempotency_key})
+        resp = idempotency_table.get_item(Key={"idempotency_key": idempotency_key}, ConsistentRead=True)
         return resp.get("Item")
     except ClientError as e:
         print(f"[WARN] Error consultando idempotencia ({idempotency_key}): {e}")

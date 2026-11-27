@@ -17,6 +17,7 @@ from db import (
     registrar_auditoria,
     verificar_idempotencia,
     iniciar_idempotencia,
+    sanitize_for_dynamodb,
     completar_idempotencia,
 )
 from events import EstadoEvento, TipoEvento, construir_detalle_evento
@@ -420,6 +421,29 @@ def quitar_del_carrito(
 # ============================================================================
 # 4. FACTURACIÓN, DESCUENTOS, IMPUESTOS, TIMBRADO Y CANCELACIÓN (SP 1,2,3,4,8)
 # ============================================================================
+def reservar_o_recuperar(clave: str, operacion: str, usuario: int, datos: dict):
+    """Solo el propietario de la reserva puede iniciar escrituras en RDS."""
+    if iniciar_idempotencia(clave, operacion, usuario, datos):
+        return None
+
+    anterior = verificar_idempotencia(clave)
+    if not anterior:
+        raise HTTPException(503, "No se pudo verificar la reserva. Reintente con la misma clave.")
+    if (anterior["id_usuario"] != usuario or anterior["operacion"] != operacion
+            or anterior["request_payload"] != sanitize_for_dynamodb(datos)):
+        raise HTTPException(422, "La clave ya pertenece a otra operación.")
+    if anterior["estado"] == "COMPLETADO":
+        return {
+            **anterior["response_data"],
+            "idempotente": True,
+            "idempotency_key": clave,
+            "mensaje_idempotencia": "Respuesta original recuperada.",
+        }
+    if anterior["estado"] == "FALLIDO":
+        raise HTTPException(400, "La operación previa falló. Revise la factura antes de iniciar otra.")
+    raise HTTPException(409, "Operación en proceso. Reintente en breve con la misma clave.")
+
+
 @app.post("/facturas/emitir", tags=["Facturación (SP)"])
 def emitir_factura(
     payload: EmitirFacturaRequest,
@@ -440,31 +464,12 @@ def emitir_factura(
         raw_key = f"{current_user['id_usuario']}-{payload.id_cliente}-{payload.serie}-{payload.usar_carrito_dynamo}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M')}"
         idempotency_key = f"IDEM-EMIT-{uuid.uuid5(uuid.NAMESPACE_DNS, raw_key)}"
 
-    # 1. Verificar si ya existe en facturacion_idempotencia
-    item_existente = verificar_idempotencia(idempotency_key)
-    if item_existente:
-        estado_prev = item_existente.get("estado")
-        if estado_prev == "COMPLETADO":
-            cached = item_existente.get("response_data", {})
-            return {
-                **cached,
-                "idempotente": True,
-                "idempotency_key": idempotency_key,
-                "mensaje_idempotencia": "Respuesta recuperada de facturacion_idempotencia (operación ya procesada previamente)",
-            }
-        elif estado_prev == "EN_PROCESO":
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Operación en proceso con Idempotency-Key '{idempotency_key}'. Reintente en unos segundos.",
-            )
-
-    # 2. Registrar en estado EN_PROCESO
-    iniciar_idempotencia(
-        idempotency_key=idempotency_key,
-        operacion="EMITIR_Y_TIMBRAR_FACTURA",
-        id_usuario=current_user["id_usuario"],
-        request_payload=payload.model_dump(),
+    anterior = reservar_o_recuperar(
+        idempotency_key, "EMITIR_Y_TIMBRAR_FACTURA", current_user["id_usuario"],
+        payload.model_dump(),
     )
+    if anterior is not None:
+        return anterior
 
     items_a_facturar = []
     pk_cart = f"CART#{current_user['id_usuario']}"
@@ -655,31 +660,12 @@ def registrar_pago(
         raw_key = f"PAGO-{id_factura}-{payload.monto_pagado}-{payload.referencia_bancaria}"
         idempotency_key = f"IDEM-PAY-{uuid.uuid5(uuid.NAMESPACE_DNS, raw_key)}"
 
-    # 1. Verificar si la llave ya fue procesada
-    item_existente = verificar_idempotencia(idempotency_key)
-    if item_existente:
-        estado_prev = item_existente.get("estado")
-        if estado_prev == "COMPLETADO":
-            cached = item_existente.get("response_data", {})
-            return {
-                **cached,
-                "idempotente": True,
-                "idempotency_key": idempotency_key,
-                "mensaje_idempotencia": "Respuesta recuperada de facturacion_idempotencia (pago ya aplicado previamente)",
-            }
-        elif estado_prev == "EN_PROCESO":
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Pago en proceso con Idempotency-Key '{idempotency_key}'. Reintente en breve.",
-            )
-
-    # 2. Registrar en estado EN_PROCESO
-    iniciar_idempotencia(
-        idempotency_key=idempotency_key,
-        operacion="REGISTRAR_PAGO",
-        id_usuario=current_user["id_usuario"],
-        request_payload={"id_factura": id_factura, **payload.model_dump()},
+    anterior = reservar_o_recuperar(
+        idempotency_key, "REGISTRAR_PAGO", current_user["id_usuario"],
+        {"id_factura": id_factura, **payload.model_dump()},
     )
+    if anterior is not None:
+        return anterior
 
     conn = get_db_connection()
     try:
@@ -817,16 +803,23 @@ def listar_logs_auditoria(
     )
     return {"total": len(resp.get("Items", [])), "eventos": resp.get("Items", [])}
 
+from pathlib import Path
 from fastapi.responses import FileResponse
-import os
+from fastapi.staticfiles import StaticFiles
 from mangum import Mangum
+
+backend_dir = Path(__file__).resolve().parent
+frontend_dir = backend_dir / "frontend"
+if not frontend_dir.is_dir():
+    frontend_dir = backend_dir.parent / "frontend"
+if (frontend_dir / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=frontend_dir / "assets"), name="frontend-assets")
+
 
 @app.get("/", include_in_schema=False)
 def serve_frontend():
-    path = os.path.join(os.path.dirname(__file__), "frontend/index.html")
-    if not os.path.exists(path):
-        path = os.path.join(os.path.dirname(__file__), "../frontend/index.html")
-    return FileResponse(path)
+    return FileResponse(frontend_dir / "index.html")
+
 
 # Handler Serverless para AWS Lambda
 handler = Mangum(app, lifespan="off")
